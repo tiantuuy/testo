@@ -1,7 +1,7 @@
 const FIXED_UUID = '64c6e2fe-e7a8-4118-b3bc-a1ecd5b9553a'; 
 const SECRET_PATH = '/your-secret-path'; 
 
-// 固定反代配置
+// 你的反代/出口代理配置
 let 反代IP = 'yx1.9898981.xyz:8443';
 
 export default {
@@ -12,9 +12,8 @@ export default {
                 return new Response('Not Found', { status: 404 });
             }
 
-            const upgradeHeader = request.headers.get('Upgrade');
-            if (upgradeHeader !== 'websocket') {
-                return new Response(JSON.stringify({ status: "UP", fallback_node: 反代IP }), { status: 200 });
+            if (request.headers.get('Upgrade') !== 'websocket') {
+                return new Response(JSON.stringify({ status: "UP", fallback: 反代IP }), { status: 200 });
             }
 
             return await handleSPESSWebSocket(request);
@@ -51,7 +50,6 @@ async function handleSPESSWebSocket(request) {
             const vlessRespHeader = new Uint8Array([result.vlessVersion[0], 0]);
             const rawClientData = chunk.slice(result.rawDataIndex);
             
-            // DNS 处理
             if (result.isUDP && result.portRemote === 53) {
                 isDns = true;
                 const { write } = await handleUDPOutBound(serverWS, vlessRespHeader);
@@ -60,16 +58,42 @@ async function handleSPESSWebSocket(request) {
                 return;
             }
 
-            // TCP 连接策略：先直连，失败则走 Fallback HTTP 代理
-            try {
-                remoteSocket = await smartConnect(result.addressRemote, result.portRemote);
-                const writer = remoteSocket.writable.getWriter();
-                await writer.write(rawClientData);
-                writer.releaseLock();
-                pipeRemoteToWebSocket(remoteSocket, serverWS, vlessRespHeader);
-            } catch (err) {
-                serverWS.close(1011, 'All connection attempts failed');
+            // --- 核心重试逻辑（参考原始代码方案） ---
+            const [proxyHost, proxyPort] = 反代IP.split(':');
+
+            // 定义重试函数：如果直连不通，则尝试通过代理
+            async function tryConnect(useProxy = false) {
+                try {
+                    let socket;
+                    if (useProxy) {
+                        // 走 HTTP CONNECT 代理方案
+                        socket = await httpConnect(result.addressRemote, result.portRemote, proxyHost, proxyPort || 8443);
+                    } else {
+                        // 尝试直连
+                        socket = await connect({ hostname: result.addressRemote, port: result.portRemote });
+                    }
+                    
+                    remoteSocket = socket;
+                    const writer = socket.writable.getWriter();
+                    await writer.write(rawClientData);
+                    writer.releaseLock();
+
+                    // 这里的 pipe 逻辑需要处理直连成功但没数据返回的情况（类似原始代码的 retry）
+                    pipeRemoteToWebSocket(socket, serverWS, vlessRespHeader, async () => {
+                        if (!useProxy) {
+                            console.log("直连无数据，尝试切换代理...");
+                            await tryConnect(true);
+                        }
+                    });
+                } catch (err) {
+                    if (!useProxy) {
+                        return await tryConnect(true);
+                    }
+                    serverWS.close(1011, 'Connection All Failed');
+                }
             }
+
+            await tryConnect(false); // 初始尝试直连
         },
         close() { if (remoteSocket) remoteSocket.close(); }
     })).catch(() => {
@@ -80,54 +104,46 @@ async function handleSPESSWebSocket(request) {
     return new Response(null, { status: 101, webSocket: clientWS });
 }
 
-/**
- * 智能连接逻辑
- * 1. 尝试直连
- * 2. 如果直连抛出错误（如访问 CF 域名被阻断），则自动切换 HTTP CONNECT 代理
- */
-async function smartConnect(host, port) {
-    try {
-        // 尝试直连
-        return await connect({ hostname: host, port: port });
-    } catch (directError) {
-        console.log(`Direct connect failed for ${host}, trying fallback via ${反代IP}`);
-        
-        // 自动解析反代IP和端口
-        const [proxyHost, proxyPortStr] = 反代IP.split(':');
-        const proxyPort = parseInt(proxyPortStr) || 8443;
+// 优化的代理连接函数
+async function httpConnect(host, port, proxyHost, proxyPort) {
+    const sock = await connect({ hostname: proxyHost, port: parseInt(proxyPort) });
+    const req = `CONNECT ${host}:${port} HTTP/1.1\r\nHost: ${host}:${port}\r\nProxy-Connection: Keep-Alive\r\n\r\n`;
 
-        // 通过 HTTP CONNECT 隧道连接
-        const sock = await connect({ hostname: proxyHost, port: proxyPort });
-        const req = `CONNECT ${host}:${port} HTTP/1.1\r\n` +
-                    `Host: ${host}:${port}\r\n` +
-                    `Proxy-Connection: Keep-Alive\r\n\r\n`;
+    const writer = sock.writable.getWriter();
+    await writer.write(new TextEncoder().encode(req));
+    writer.releaseLock();
 
-        const writer = sock.writable.getWriter();
-        await writer.write(new TextEncoder().encode(req));
-        writer.releaseLock();
+    const reader = sock.readable.getReader();
+    const { value } = await reader.read();
+    const resp = new TextDecoder().decode(value);
+    reader.releaseLock();
 
-        const reader = sock.readable.getReader();
-        const { value } = await reader.read();
-        const resp = new TextDecoder().decode(value);
-        reader.releaseLock();
-
-        if (resp.includes(' 200')) {
-            return sock;
-        } else {
-            sock.close();
-            throw new Error('Fallback proxy failed');
-        }
-    }
+    if (resp.includes(' 200')) return sock;
+    sock.close();
+    throw new Error('Proxy Handshake Failed');
 }
 
-// 高效转发（YouTube 优化版）
-async function pipeRemoteToWebSocket(remoteSocket, ws, vlessHeader) {
+// 转发逻辑：整合了“重试触发器”
+async function pipeRemoteToWebSocket(remoteSocket, ws, vlessHeader, onNoDataFallback) {
     const reader = remoteSocket.readable.getReader();
     let headerSent = false;
+    let dataReceived = false;
+
     try {
+        // 设置一个简易的超时监测，如果 1.5 秒没收到数据且需要 fallback
+        const timeout = setTimeout(() => {
+            if (!dataReceived && onNoDataFallback) {
+                reader.cancel(); // 终止当前读取，触发外层的 fallback
+            }
+        }, 1500);
+
         while (true) {
             const { done, value } = await reader.read();
             if (done || ws.readyState !== 1) break;
+
+            dataReceived = true;
+            clearTimeout(timeout);
+
             if (!headerSent) {
                 const combined = new Uint8Array(vlessHeader.byteLength + value.byteLength);
                 combined.set(vlessHeader, 0);
@@ -138,13 +154,18 @@ async function pipeRemoteToWebSocket(remoteSocket, ws, vlessHeader) {
                 ws.send(value);
             }
         }
-    } catch (e) {} finally {
+    } catch (e) {
+        if (!dataReceived && onNoDataFallback) {
+            await onNoDataFallback();
+        }
+    } finally {
         reader.releaseLock();
-        if (ws.readyState === 1) ws.close();
     }
 }
 
-// DNS DoH 处理
+// --- 其余 VLESS 解析和 DNS 逻辑保持不变 ---
+import { connect } from 'cloudflare:sockets';
+
 async function handleUDPOutBound(webSocket, vlessHeader) {
     let headerSent = false;
     const transformStream = new TransformStream({
@@ -170,12 +191,8 @@ async function handleUDPOutBound(webSocket, vlessHeader) {
             }
         }
     }));
-    const writer = transformStream.writable.getWriter();
-    return { write(chunk) { writer.write(chunk); } };
+    return { write(chunk) { transformStream.writable.getWriter().write(chunk); } };
 }
-
-// 辅助函数
-import { connect } from 'cloudflare:sockets';
 
 function createWebSocketReadableStream(ws, earlyDataHeader) {
     return new ReadableStream({
