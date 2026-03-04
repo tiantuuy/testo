@@ -1,4 +1,4 @@
-name = "testo"
+name = "testo1"
 main = "_worker.js"
 compatibility_date = "2025-03-16"
 workers_dev = true
